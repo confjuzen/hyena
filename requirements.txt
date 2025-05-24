@@ -1,0 +1,6 @@
+python-rtmidi
+pyfluidsynth
+inputs
+mido
+numpy
+sounddevice
