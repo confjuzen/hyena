@@ -1,6 +1,7 @@
 python-rtmidi
 pyfluidsynth
-inputs
+evdev
 mido
 numpy
 sounddevice
+urwid
