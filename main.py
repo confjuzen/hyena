@@ -1,157 +1,79 @@
-import os
-os.environ['ALSA_NO_WARN'] = '1'
-
-import mido
-import fluidsynth
-import sounddevice as sd
-from modules.oscillator import midi_to_freq
-from synth import SYNTH
-import numpy as np
-import threading
 import time
-from screen import main
-from controler import control
+import midi_handler
+import audio_engine
+import ui
+from synth_modes import synth_mode
 
-sd.default.device = "pipewire"
+import controller_handler
 
+from collections import deque
 
-SAMPLE_RATE = 44100
-active_voices = {}  # note -> SYNTH instance
+clock_ticks = 0
+last_tick_times = deque(maxlen=24)
+loop_start_time = time.time()
+loop_length_beats = 4
+tick_times = deque(maxlen=48)
+bpm = 120.0
+def update_bpm_from_clock():
+    global bpm
+    now = time.time()  # seconds
+    tick_times.append(now)
+    if len(tick_times) >= 2:
+        elapsed = tick_times[-1] - tick_times[0]
+        num_ticks = len(tick_times)
+        tps = num_ticks / elapsed
+        bps = tps / 24
+        bpm = bps * 60
+    return bpm
 
-VOICE_LOCK = threading.Lock()  # to protect active_voices in callback & MIDI thread
+active_notes = {}
 
+def midi_callback(msg):
+    global clock_ticks, bpm, loop_start_time
 
+    if msg.type == 'clock':
+        bpm = update_bpm_from_clock()
+        clock_ticks += 1
 
-class SharedAudioBuffer:
-    def __init__(self, max_size=44100):
-        self.lock = threading.Lock()
-        self.left = np.zeros(max_size, dtype=np.float32)
-        self.right = np.zeros(max_size, dtype=np.float32)
-        self.max_size = max_size
-        self.pos = 0  # write position
+    elif msg.type == 'start':
+        clock_ticks = 0
+        loop_start_time = time.time()
+        print("[midi] START received — resetting loop")
 
-    def update(self, left_chunk, right_chunk):
-        with self.lock:
-            chunk_size = len(left_chunk)
-            # Circular buffer write
-            end_pos = (self.pos + chunk_size) % self.max_size
-            if self.pos + chunk_size <= self.max_size:
-                self.left[self.pos:self.pos + chunk_size] = left_chunk
-                self.right[self.pos:self.pos + chunk_size] = right_chunk
-            else:
-                part1_len = self.max_size - self.pos
-                self.left[self.pos:] = left_chunk[:part1_len]
-                self.left[:end_pos] = left_chunk[part1_len:]
-                self.right[self.pos:] = right_chunk[:part1_len]
-                self.right[:end_pos] = right_chunk[part1_len:]
-            self.pos = end_pos
+    elif msg.type == 'stop':
+        print("[midi] STOP")
 
-    def get_buffer(self, length):
-        with self.lock:
-            if self.pos - length < 0:
-                # wrap around
-                part1_len = length - self.pos
-                left_data = np.concatenate((self.left[self.max_size - part1_len:], self.left[:self.pos]))
-                right_data = np.concatenate((self.right[self.max_size - part1_len:], self.right[:self.pos]))
-            else:
-                left_data = self.left[self.pos - length:self.pos]
-                right_data = self.right[self.pos - length:self.pos]
-            return left_data.copy(), right_data.copy()
+    if msg.type == 'style':
+        print("scale :", msg.style)
 
-shared_audio_buffer = SharedAudioBuffer()
+    if msg.type == 'note_on' and msg.velocity > 0:
+        freq = 440.0 * 2 ** ((msg.note - 69) / 12)
+        active_notes[msg.note] = freq
+        audio_engine.note_on(freq)
+        print(f"Note ON: {msg.note} -> {freq:.2f} Hz")
 
+    elif msg.type == 'note_off' or (msg.type == 'note_on' and msg.velocity == 0):
+        freq = active_notes.get(msg.note)
+        if freq:
+            audio_engine.note_off(freq)
+            del active_notes[msg.note]
+            print(f"Note OFF: {msg.note}")
 
-def audio_callback(outdata, frames, time, status):
-    with VOICE_LOCK:
-        if not active_voices:
-            outdata[:] = np.zeros((frames, 2), dtype=np.float32)
-            shared_audio_buffer.update(np.zeros(frames), np.zeros(frames))
-            return
-        
-        buffer = np.zeros((frames, 2), dtype=np.float32)
-        to_remove = []
-        
-        for note, synth in active_voices.items():
-            wave = synth.generate(frames)
-            buffer += wave
-            if not synth.active:
-                to_remove.append(note)
-        
-        # Remove voices that finished playing
-        for note in to_remove:
-            del active_voices[note]
-        
-        max_amp = np.max(np.abs(buffer))
-        if max_amp > 1.0:
-            buffer /= max_amp
-        
-        shared_audio_buffer.update(buffer[:,0], buffer[:,1])
-        
-        outdata[:] = buffer
+def main():
+    screen = ui.init_ui()
+    midi_port = midi_handler.open_midi_input(midi_callback)
+    controller = controller_handler.init_controller()
+    audio_engine.start_audio()
+    start_time = time.time()
+    synth_text = synth_mode()
+    while True:
+        now = time.time()
+        beats = clock_ticks / 24
+        loop_progress = (beats % loop_length_beats) / loop_length_beats
+        ui.draw_ui(screen, loop_progress, bpm, synth_text)
+        axes, buttons = controller_handler.poll_controller(controller)
 
-stream = sd.OutputStream(
-    samplerate=SAMPLE_RATE, 
-    channels=2, 
-    callback=audio_callback,
-    dtype='float32'
-)
-stream.start()
+        time.sleep(0.016)
 
-def note_on_channel_2(msg):
-    note = msg.note
-    freq = midi_to_freq(note)
-    velocity = msg.velocity
-    with VOICE_LOCK:
-        if note not in active_voices:
-            active_voices[note] = SYNTH(freq, velocity, SAMPLE_RATE)
-        else:
-            # Retrigger envelope if note already exists
-            active_voices[note].adsr.note_on()
-
-def note_off_channel_2(msg):
-    note = msg.note
-    with VOICE_LOCK:
-        synth = active_voices.get(note)
-        if synth:
-            synth.note_off()  # triggers release phase
-
-fs = fluidsynth.Synth()
-fs.start(driver="pulseaudio")
-sfid = fs.sfload("/usr/share/soundfonts/FluidR3_GM.sf2")
-fs.program_select(0, sfid, 0, 0)
-
-input_name = [p for p in mido.get_input_names() if "Behringer" in p][0]
-
-def midi_loop():
-    with mido.open_input(input_name) as inport:
-        print("Connected to MIDI input:", input_name)
-        try:
-            for msg in inport:
-                if msg.type == 'note_on' and msg.velocity > 0:
-                    print(f"Note ON, channel {msg.channel + 1}, note {msg.note}, velocity {msg.velocity}")
-                    if msg.channel == 0:
-                        fs.noteon(0, msg.note, msg.velocity)
-                    elif msg.channel == 1:
-                        note_on_channel_2(msg)
-                elif msg.type == 'note_off':
-                    print(f"Note OFF, channel {msg.channel + 1}, note {msg.note}")
-                    if msg.channel == 0:
-                        fs.noteoff(0, msg.note)
-                    elif msg.channel == 1:
-                        note_off_channel_2(msg)
-
-        except KeyboardInterrupt:
-            print(" Bye!")
-            fs.delete()
-            stream.stop()
-            stream.close()
-
-
-synth = SYNTH(freq=440.0, velocity=100, sample_rate=SAMPLE_RATE)
-
-midi_thread = threading.Thread(target=midi_loop, daemon=True)
-midi_thread.start()
-
-control(synth)
-
-main()
+if __name__ == "__main__":
+    main()

@@ -1,7 +1,7 @@
 python-rtmidi
 pyfluidsynth
-evdev
+pygame-ce
 mido
 numpy
 sounddevice
-urwid
+
